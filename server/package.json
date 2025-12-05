@@ -1,0 +1,19 @@
+{
+  "name": "live-vote-server",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "nodemon index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
