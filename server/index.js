@@ -1,4 +1,4 @@
-// index.js (Render-ready)
+// index.js (Render-ready, robust validation + debug)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -7,14 +7,37 @@ const cors = require('cors');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.NOWPAYMENTS_API_KEY || '';
+const API_KEY = (process.env.NOWPAYMENTS_API_KEY || '').trim();
 const NOW_API_BASE = 'https://api.nowpayments.io/v1';
+
+// helper: safe trim + validate URL
+function safeUrlFromEnv(envVar) {
+  if (!envVar) return null;
+  const trimmed = String(envVar).trim();
+  if (!trimmed) return null;
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.toString();
+  } catch (e) {
+    return null;
+  }
+}
+
+// Pre-validate SUCCESS_URL / CANCEL_URL from env (they may be invalid in env)
+const SUCCESS_URL = safeUrlFromEnv(process.env.SUCCESS_URL);
+const CANCEL_URL = safeUrlFromEnv(process.env.CANCEL_URL);
+if (process.env.SUCCESS_URL && !SUCCESS_URL) {
+  console.warn('[WARN] SUCCESS_URL env is set but is NOT a valid http(s) URL:', process.env.SUCCESS_URL);
+}
+if (process.env.CANCEL_URL && !CANCEL_URL) {
+  console.warn('[WARN] CANCEL_URL env is set but is NOT a valid http(s) URL:', process.env.CANCEL_URL);
+}
 
 // Helper: allow explicit FRONTEND_ORIGIN (prod) OR any localhost/127.0.0.1 origin (dev)
 function isAllowedOrigin(origin) {
-  // origin === undefined || null for non-browser clients (curl, server-to-server)
-  if (!origin) return true;
-  const configured = process.env.FRONTEND_ORIGIN;
+  if (!origin) return true; // allow non-browser clients (curl, server-to-server)
+  const configured = (process.env.FRONTEND_ORIGIN || '').trim();
   if (configured && origin === configured) return true;
   // allow localhost or 127.0.0.1 on any port (http or https)
   const localhostRegex = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i;
@@ -25,20 +48,18 @@ const corsOptions = {
   origin: (origin, callback) => {
     try {
       if (isAllowedOrigin(origin)) return callback(null, true);
-      // if origin is not allowed, pass an error (browser will block the call)
       return callback(new Error(`CORS policy: origin ${origin} not allowed`));
     } catch (e) {
       return callback(new Error('CORS origin check failed'));
     }
   },
-  optionsSuccessStatus: 200, // for legacy browsers
+  optionsSuccessStatus: 200,
 };
 
-// Apply CORS globally (including preflight)
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
-// Small request logger for Render logs (very helpful)
+// request logger
 app.use((req, res, next) => {
   console.log('[REQ]', {
     method: req.method,
@@ -49,12 +70,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// JSON parser + handle bad JSON
-app.use(express.json({ limit: '100kb' }));
+// parse JSON and handle malformed JSON gracefully
+app.use(express.json({ limit: '200kb' }));
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
     console.warn('[ERR] Bad JSON received');
-    return res.status(400).json({ error: 'invalid_json', message: 'Request body contains invalid JSON' });
+    return res.status(400).json({ success: false, error: 'invalid_json', message: 'Request body contains invalid JSON' });
   }
   next();
 });
@@ -67,15 +88,16 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 
 async function createInvoiceHandler(req, res) {
   if (!API_KEY) {
-    return res.status(500).json({ error: 'NOWPAYMENTS_API_KEY is not configured on the server' });
+    return res.status(500).json({ success: false, error: 'NOWPAYMENTS_API_KEY not configured on server' });
   }
 
   try {
-    const { amount, currency = 'USD', order_id, order_description, ipn_callback_url } = req.body || {};
+    // Accept either "price_amount" or "amount" in request body for flexibility
+    const { amount, price_amount, currency = 'USD', order_id, order_description, ipn_callback_url } = req.body || {};
 
-    const numericAmount = Number(amount);
+    const numericAmount = Number(price_amount ?? amount);
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-      return res.status(400).json({ error: 'invalid_amount', message: 'amount must be a positive number' });
+      return res.status(400).json({ success: false, error: 'invalid_amount', message: 'amount must be a positive number' });
     }
 
     // Build payload in NowPayments expected shape
@@ -86,9 +108,19 @@ async function createInvoiceHandler(req, res) {
       order_description: order_description || 'Donation',
     };
 
-    if (process.env.SUCCESS_URL) payload.success_url = process.env.SUCCESS_URL;
-    if (process.env.CANCEL_URL) payload.cancel_url = process.env.CANCEL_URL;
-    if (ipn_callback_url) payload.ipn_callback_url = ipn_callback_url;
+    // Only include success_url / cancel_url if they are valid absolute http(s) URLs
+    if (SUCCESS_URL) payload.success_url = SUCCESS_URL;
+    else if (process.env.SUCCESS_URL) console.warn('[WARN] Not including invalid SUCCESS_URL in payload');
+
+    if (CANCEL_URL) payload.cancel_url = CANCEL_URL;
+    else if (process.env.CANCEL_URL) console.warn('[WARN] Not including invalid CANCEL_URL in payload');
+
+    if (ipn_callback_url) {
+      // accept ipn_callback_url from request only if it's a valid absolute URL
+      const safeIpn = safeUrlFromEnv(ipn_callback_url);
+      if (safeIpn) payload.ipn_callback_url = safeIpn;
+      else console.warn('[WARN] Ignoring invalid ipn_callback_url provided by client:', ipn_callback_url);
+    }
 
     console.log('Creating NowPayments invoice — payload:', payload);
 
@@ -111,7 +143,7 @@ async function createInvoiceHandler(req, res) {
 
     if (!invoiceUrl) {
       console.error('No invoice URL in NowPayments response:', resp?.data);
-      return res.status(502).json({ error: 'no_invoice_url', message: 'No invoice URL returned from NowPayments', raw: resp?.data || null });
+      return res.status(502).json({ success: false, error: 'no_invoice_url', message: 'No invoice URL returned from NowPayments', upstream: resp?.data || null });
     }
 
     const normalized = {
@@ -124,7 +156,6 @@ async function createInvoiceHandler(req, res) {
     console.log('NowPayments invoice URL:', normalized.invoice_url);
     return res.json(normalized);
   } catch (err) {
-    // Log rich diagnostics to Render logs
     console.error('create-invoice error:', {
       message: err.message,
       status: err.response?.status || null,
@@ -133,7 +164,6 @@ async function createInvoiceHandler(req, res) {
     });
 
     const code = err.response?.status || 502;
-    // Return a safe, predictable error shape for the frontend and include upstream body under "upstream"
     return res.status(code).json({
       success: false,
       error: err.message || 'unknown_error',
@@ -142,7 +172,6 @@ async function createInvoiceHandler(req, res) {
   }
 }
 
-// Two routes (some clients call /create-invoice, others /api/create-invoice)
 app.post('/create-invoice', createInvoiceHandler);
 app.post('/api/create-invoice', createInvoiceHandler);
 
